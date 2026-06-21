@@ -1,0 +1,25 @@
+# Build output
+x64/
+Win32/
+*.asi
+*.dll
+*.obj
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.exp
+*.lib
+*.log
+
+# VS user/cache
+.vs/
+*.user
+*.vcxproj.user
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Keep the shipped config and the release zip out of normal source rules
+!HUDFix.ini
