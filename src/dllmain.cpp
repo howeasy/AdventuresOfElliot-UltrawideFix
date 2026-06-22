@@ -24,6 +24,7 @@
 #include <safetyhook.hpp>
 
 #include <unordered_set>
+#include <unordered_map>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -34,7 +35,7 @@ HMODULE exeModule = GetModuleHandle(NULL);
 HMODULE thisModule;
 
 std::string sFixName = "HUDFix";
-std::string sFixVersion = "0.32.0-final";
+std::string sFixVersion = "1.0.1";
 std::filesystem::path sFixPath;
 
 inipp::Ini<char> ini;
@@ -53,6 +54,21 @@ float fHUDWidth = 0.0f, fHUDWidthOffset = 0.0f, fHUDHeight = 0.0f, fHUDHeightOff
 bool bFixHUD = true;
 bool bDiagnostic = true;
 int  iSweepIntervalMs = 2000;
+int  iMarkerShiftPx = -1;   // interact-prompt anchor shift in px; -1 = auto (= HUD pillarbox offset)
+
+// Border-decoration identify/fix tool (off unless BorderWidget is set). Operates on every widget in
+// the HUD tree whose name contains BorderWidget: hide=make invisible (to identify it), shiftL=render-
+// translate to the screen edge, scale=counter-scale to full screen. BorderShiftPx -1 = auto(=offset).
+std::string sBorderWidget = "";
+std::string sBorderMode = "hide";   // hide | shiftL | scale
+int  iBorderShiftPx = -1;
+
+// Shrink tool: render-scale every HUD widget whose name contains ShrinkWidget. ShrinkScale<1 shrinks;
+// ShrinkPivotX/Y choose the anchor the scale pulls toward (0,1 = bottom-left corner stays put).
+std::string sShrinkWidget = "";
+double dShrinkScale = 1.0;
+double dShrinkPivotX = 0.5, dShrinkPivotY = 0.5;
+double dShrinkOffsetX = 0.0, dShrinkOffsetY = 0.0;   // px nudge after scaling (-X=left, +Y=down)
 
 // [Debug] isolation toggles (default everything OFF -> minimal probe that only logs + idles)
 bool bInstallResHook = false;
@@ -113,6 +129,16 @@ void Configuration()
         inipp::get_value(ini.sections["Fix HUD"], "Enabled", bFixHUD);
         inipp::get_value(ini.sections["Fix HUD"], "Diagnostic", bDiagnostic);
         inipp::get_value(ini.sections["Fix HUD"], "SweepIntervalMs", iSweepIntervalMs);
+        inipp::get_value(ini.sections["Fix HUD"], "MarkerShiftPx", iMarkerShiftPx);
+        inipp::get_value(ini.sections["Fix HUD"], "BorderWidget", sBorderWidget);
+        inipp::get_value(ini.sections["Fix HUD"], "BorderMode", sBorderMode);
+        inipp::get_value(ini.sections["Fix HUD"], "BorderShiftPx", iBorderShiftPx);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkWidget", sShrinkWidget);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkScale", dShrinkScale);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkPivotX", dShrinkPivotX);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkPivotY", dShrinkPivotY);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkOffsetX", dShrinkOffsetX);
+        inipp::get_value(ini.sections["Fix HUD"], "ShrinkOffsetY", dShrinkOffsetY);
         inipp::get_value(ini.sections["Debug"], "InstallResHook", bInstallResHook);
         inipp::get_value(ini.sections["Debug"], "EnableSweep", bEnableSweep);
         inipp::get_value(ini.sections["Debug"], "SweepStartDelayMs", iSweepStartDelayMs);
@@ -120,6 +146,16 @@ void Configuration()
     spdlog_confparse(bFixHUD);
     spdlog_confparse(bDiagnostic);
     spdlog_confparse(iSweepIntervalMs);
+    spdlog_confparse(iMarkerShiftPx);
+    spdlog_confparse(sBorderWidget);
+    spdlog_confparse(sBorderMode);
+    spdlog_confparse(iBorderShiftPx);
+    spdlog_confparse(sShrinkWidget);
+    spdlog_confparse(dShrinkScale);
+    spdlog_confparse(dShrinkPivotX);
+    spdlog_confparse(dShrinkPivotY);
+    spdlog_confparse(dShrinkOffsetX);
+    spdlog_confparse(dShrinkOffsetY);
     spdlog_confparse(bInstallResHook);
     spdlog_confparse(bEnableSweep);
     spdlog_confparse(iSweepStartDelayMs);
@@ -462,10 +498,127 @@ static void ReapplyOneSEH(void* w)   // POD wrapper so PE hook can __try around 
     __try { CounterScaleVignettes(w); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// We only need the trampoline (ProcessEvent_sh) so the AddWidget hook can call game UFunctions on
-// the game thread; the hook body itself just forwards to the original.
+// ---- Diagnostic: watch how the game positions widgets each frame (find the world-tracked Ⓧ) ----
+// Resolved (canonical UWidget/UUserWidget UFunctions) in ConstrainIfHud once.
+static SDK::UObject* gFnSetRenderTransform = nullptr;
+static SDK::UObject* gFnSetRenderTranslation = nullptr;
+static SDK::UObject* gFnSetPositionInViewport = nullptr;
+static void* gHudWidget = nullptr;   // cached WB_HUDLayout for periodic tree dumps
+
+// Recursive widget-tree snapshot: name, slot kind, live canvas position/anchors, render translation.
+// Run periodically while the Ⓧ is on screen so the widget sitting at its (wrong) location stands out.
+static void DumpTree(SDK::UObject* w, int depth, int& budget)
+{
+    if (!PtrLooksValid(w) || budget <= 0 || depth > 9) return;
+    --budget;
+    std::string nm = w->GetName();
+    SDK::UObject* slot = RdMem<SDK::UObject*>(w, OFF_Widget_Slot);   // UPanelSlot* @0x30
+    float rx = RdMem<float>(w, 0x90), ry = RdMem<float>(w, 0x94);    // RenderTransform.Translation
+    if (PtrLooksValid(slot) && ObjectIsA(slot, "CanvasPanelSlot")) {
+        uint8_t* ld = reinterpret_cast<uint8_t*>(slot) + OFF_CanvasSlot_LayoutData;
+        float*  o = reinterpret_cast<float*>(ld);                              // L,T,R,B (pos/size)
+        double* a = reinterpret_cast<double*>(ld + OFF_Anchors_in_LayoutData); // anchors
+        spdlog::info("{:>{}}{} [canvas pos=({:.0f},{:.0f}) sz=({:.0f},{:.0f}) anc=({:.2f},{:.2f})-({:.2f},{:.2f})] rt=({:.0f},{:.0f})",
+            "", depth * 2, nm, o[0], o[1], o[2], o[3], a[0], a[1], a[2], a[3], rx, ry);
+    } else {
+        std::string st = PtrLooksValid(slot) ? reinterpret_cast<SDK::UObject*>(slot)->GetName() : "none";
+        spdlog::info("{:>{}}{} [{}] rt=({:.0f},{:.0f})", "", depth * 2, nm, st, rx, ry);
+    }
+    if (ObjectIsA(w, "UserWidget")) {
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        if (PtrLooksValid(root)) DumpTree(reinterpret_cast<SDK::UObject*>(root), depth + 1, budget);
+    }
+    if (ObjectIsA(w, "PanelWidget")) {
+        void* slotsData = RdMem<void*>(w, OFF_PanelWidget_Slots);
+        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
+        if (PtrLooksValid(slotsData) && num > 0 && num <= 256) {
+            for (int i = 0; i < num && budget > 0; ++i) {
+                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(slotsData)[i];
+                if (!PtrLooksValid(s)) continue;
+                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);   // UPanelSlot::Content
+                if (PtrLooksValid(ch)) DumpTree(ch, depth + 1, budget);
+            }
+        }
+    }
+}
+static void DumpTreeTick()
+{
+  try {
+    if (!PtrLooksValid(gHudWidget)) return;
+    static uint64_t lastDump = 0; static int dumps = 0;
+    uint64_t now = GetTickCount64();
+    if (dumps >= 6 || now - lastDump < 3000) return;
+    lastDump = now; ++dumps;
+    spdlog::info("=== TREE dump #{} (HUD descendants) ===", dumps);
+    int budget = 700;
+    DumpTree(reinterpret_cast<SDK::UObject*>(gHudWidget), 0, budget);
+  } catch (...) {}
+}
+
+// Cached interact-prompt widgets (set when constraining the HUD) + a lightweight live logger that
+// prints their slot pos / anchors / render-transform and the resulting predicted screen X. This is
+// how we measure the true coordinate transform (vs full-tree dumps, which hitch the game thread).
+static std::vector<void*> gMarkerWidgets;          // cached OUTER InteractiveGuideWidget(s)
+static SDK::UObject* gSetRenderTranslationFn = nullptr;
+static double gMarkTrX = 0.0, gMarkTrY = 0.0;      // correction applied to each prompt's inner root
+static void MarkerStateTick()
+{
+  try {
+    if (gMarkerWidgets.empty() || fHUDWidth <= 0.0f || !gSetRenderTranslationFn) return;
+    static uint64_t last = 0; uint64_t now = GetTickCount64();
+    if (now - last < 1000) return; last = now;
+    for (void* p : gMarkerWidgets) {
+        if (!PtrLooksValid(p)) continue;
+        SDK::UObject* w = reinterpret_cast<SDK::UObject*>(p);
+        SDK::UObject* slot = RdMem<SDK::UObject*>(w, OFF_Widget_Slot);
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        SDK::UObject* tgt = PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root) : w;
+        // re-apply the correction to the inner root (idempotent) so it survives show/hide/recreate
+        double tr[2] = { gMarkTrX, gMarkTrY };
+        ProcessEvent_sh.thiscall<void>(tgt, gSetRenderTranslationFn, tr);
+        if (bDiagnostic && PtrLooksValid(slot) && ObjectIsA(slot, "CanvasPanelSlot")) {
+            float irx = RdMem<float>(tgt, 0x90), iry = RdMem<float>(tgt, 0x94);
+            float* o = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(slot) + OFF_CanvasSlot_LayoutData);
+            spdlog::info("MARK '{}' outerPos=({:.0f},{:.0f}) innerRT=({:.0f},{:.0f}) shift=({:.0f},{:.0f})",
+                w->GetName(), o[0], o[1], irx, iry, gMarkTrX, gMarkTrY);
+        }
+    }
+  } catch (...) {}
+}
+static std::unordered_map<std::string, int> gPosLogCount;   // throttle per (object,fn)
+static const char* PosFnTag(SDK::UObject* fn)
+{
+    if (fn == gFnSetRenderTransform)    return "SetRenderTransform";
+    if (fn == gFnSetRenderTranslation)  return "SetRenderTranslation";
+    if (fn == gFnSetPositionInViewport) return "SetPositionInViewport";
+    return "?";
+}
+static void PosLog(SDK::UObject* obj, SDK::UObject* fn, void* params)
+{
+  try {
+    if (!PtrLooksValid(obj) || !PtrLooksValid(params)) return;
+    std::string n = obj->GetName();
+    const char* tag = PosFnTag(fn);
+    int& c = gPosLogCount[n + "|" + tag];
+    if (c >= 8) return;                 // a few samples so we can see coords change with the world
+    ++c;
+    float*  f = reinterpret_cast<float*>(params);
+    double* d = reinterpret_cast<double*>(params);
+    spdlog::info("POS {} '{}' f=[{:.1f},{:.1f},{:.1f},{:.1f}] d=[{:.1f},{:.1f}]",
+        tag, n, f[0], f[1], f[2], f[3], d[0], d[1]);
+  } catch (...) {}
+}
+
+// We need the trampoline (ProcessEvent_sh) so the AddWidget hook can call game UFunctions on the
+// game thread; with Diagnostic on we also sample the game's own positioning calls to find markers.
 void __fastcall ProcessEvent_hk(SDK::UObject* obj, SDK::UObject* fn, void* params)
 {
+    if (bDiagnostic && params &&
+        (fn == gFnSetRenderTransform || fn == gFnSetRenderTranslation || fn == gFnSetPositionInViewport))
+        PosLog(obj, fn, params);
+    MarkerStateTick();   // functional: re-applies the interact-prompt correction (logs only if Diagnostic)
     ProcessEvent_sh.thiscall<void>(obj, fn, params);
 }
 
@@ -487,6 +640,7 @@ static std::unordered_set<void*> gSeenAdd;
 
 static void LogAddToScreen(void* widget, void* tmpl)   // uses std::string -> no __try here
 {
+  try {
     if (!PtrLooksValid(widget)) return;
     if (gSeenAdd.count(widget)) return;
     gSeenAdd.insert(widget);
@@ -496,6 +650,7 @@ static void LogAddToScreen(void* widget, void* tmpl)   // uses std::string -> no
     // dump first 0x40 bytes as floats so we can see the real FGameViewportWidgetSlot/FAnchorData layout
     spdlog::info("AddWidget '{}' tmpl={} | [0x00]={:.3f},{:.3f},{:.3f},{:.3f} [0x10]={:.3f},{:.3f},{:.3f},{:.3f} [0x20]={:.3f},{:.3f},{:.3f},{:.3f} [0x30]={:.3f},{:.3f},{:.3f},{:.3f}",
         name, tmpl, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+  } catch (...) {}
 }
 
 // Constrain a just-added viewport widget to a centred 16:9 band via SetAnchorsInViewport.
@@ -522,6 +677,7 @@ static std::string StripInstanceSuffix(const std::string& n)
 }
 static void DumpChildren(void* widget, const std::string& widgetName)
 {
+  try {
     std::string cls = StripInstanceSuffix(widgetName);
     if (gDumpedClasses.count(cls)) return;
     gDumpedClasses.insert(cls);
@@ -537,8 +693,34 @@ static void DumpChildren(void* widget, const std::string& widgetName)
         SDK::UObject* slot = reinterpret_cast<SDK::UObject**>(slotsData)[i];
         if (!PtrLooksValid(slot)) continue;
         SDK::UObject* child = RdMem<SDK::UObject*>(slot, 0x30);   // UPanelSlot::Content
-        if (PtrLooksValid(child)) spdlog::info("   {} child[{}] '{}'", cls, i, child->GetName());
+        if (!PtrLooksValid(child)) continue;
+        // For CanvasPanelSlot children, also log anchors + offsets so we can tell which children are
+        // corner-anchored (decorations/borders) or world-tracked (markers) vs stretched HUD layers.
+        // LayoutData @0x38: FMargin Offsets(4 float @0x00), FAnchors(4 double @0x10), FVector2D Align(@0x30).
+        if (ObjectIsA(slot, "CanvasPanelSlot")) {
+            uint8_t* ld = reinterpret_cast<uint8_t*>(slot) + OFF_CanvasSlot_LayoutData;
+            float*  offs = reinterpret_cast<float*>(ld);                                   // L,T,R,B
+            double* anc  = reinterpret_cast<double*>(ld + OFF_Anchors_in_LayoutData);       // MinX,MinY,MaxX,MaxY
+            spdlog::info("   {} child[{}] '{}' anchors=({:.3f},{:.3f})-({:.3f},{:.3f}) offs=({:.1f},{:.1f},{:.1f},{:.1f})",
+                cls, i, child->GetName(), anc[0], anc[1], anc[2], anc[3], offs[0], offs[1], offs[2], offs[3]);
+        } else {
+            spdlog::info("   {} child[{}] '{}' slot='{}'", cls, i, child->GetName(),
+                reinterpret_cast<SDK::UObject*>(slot)->GetName());
+        }
     }
+  } catch (...) {}
+}
+
+// World-tracked marker widgets (e.g. the interact-prompt mark shown next to NPCs/items). These
+// position themselves via ProjectWorldToScreen in FULL-screen pixels, so when their parent HUD is
+// constrained to 16:9 (origin shifted in by the pillarbox) they render offset by +HUDWidthOffset.
+// We counter-translate them back by -HUDWidthOffset to realign with the world.
+static bool IsWorldMarkerName(const std::string& n)
+{
+    // The Ⓧ interact prompt. It lives deep in WB_HUDLayout > Overlay_0 > CanvasPanel_0, positioned
+    // by absolute canvas-slot pos = ProjectWorldToScreen (full-screen px) every frame. Inside the
+    // 16:9-constrained HUD (origin at +HUDWidthOffset) it renders that far too far right.
+    return n.find("InteractiveGuideWidget") != std::string::npos;
 }
 
 // Full-screen child overlays that must NOT be pillarboxed (damage/screen vignettes). When the HUD
@@ -575,6 +757,7 @@ static void DisableClip(SDK::UObject* w)
 static SDK::UObject* gSlotSetAnchorsFn = nullptr;
 static void CounterScaleVignettes(void* hud)
 {
+  try {
     if (iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
     SDK::UObject* tree = RdMem<SDK::UObject*>(hud, OFF_UserWidget_WidgetTree);
     if (!PtrLooksValid(tree)) return;
@@ -628,20 +811,204 @@ static void CounterScaleVignettes(void* hud)
             }
         }
     }
+  } catch (...) {}
+}
+
+// Recursively find the world-tracked interact prompt(s) and shift their canvas-slot ANCHOR so the
+// absolute slot position the game writes each frame (it never touches anchors) realigns inside the
+// constrained HUD. Anchor a is in parent-fraction; moving it by -shift/HUDWidth offsets the prompt's
+// origin back toward the true screen edge. Also caches the widget for the live MARK logger.
+static void TranslateMarkersRec(SDK::UObject* w, int depth)
+{
+    if (!PtrLooksValid(w) || depth > 7) return;
+    if (IsWorldMarkerName(w->GetName())) {
+        // Translate the prompt's INNER content root. The game writes the OUTER widget's slot pos AND
+        // its render transform every frame (clobbering anything set there), but never touches the
+        // inner WBP content, so a render-translation on the inner root is a stable band-offset fix.
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        SDK::UObject* tgt = PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root) : w;
+        if (!gSetRenderTranslationFn) {
+            SDK::UClass* c = ObjClass(tgt);
+            if (PtrLooksValid(c)) gSetRenderTranslationFn = FindUFunction(c, "SetRenderTranslation");
+        }
+        if (gSetRenderTranslationFn) {
+            double tr[2] = { gMarkTrX, gMarkTrY };
+            ProcessEvent_sh.thiscall<void>(tgt, gSetRenderTranslationFn, tr);
+            bool seen = false; for (void* p : gMarkerWidgets) if (p == w) { seen = true; break; }
+            if (!seen) gMarkerWidgets.push_back(w);
+            spdlog::info("Interact marker '{}' inner-root translate ({:.0f},{:.0f}) root='{}'",
+                w->GetName(), gMarkTrX, gMarkTrY,
+                PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root)->GetName() : "self");
+        }
+        return;
+    }
+    if (ObjectIsA(w, "UserWidget")) {
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        if (PtrLooksValid(root)) TranslateMarkersRec(reinterpret_cast<SDK::UObject*>(root), depth + 1);
+    }
+    if (ObjectIsA(w, "PanelWidget")) {
+        void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
+        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
+        if (PtrLooksValid(sd) && num > 0 && num <= 256)
+            for (int i = 0; i < num; ++i) {
+                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
+                if (!PtrLooksValid(s)) continue;
+                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);   // UPanelSlot::Content
+                if (PtrLooksValid(ch)) TranslateMarkersRec(ch, depth + 1);
+            }
+    }
+}
+static void CounterTranslateMarkers(void* hud)
+{
+  try {
+    if (iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
+    const bool ultrawide = (fAspectRatio > fNativeAspect);
+    double shiftPx = (iMarkerShiftPx >= 0) ? (double)iMarkerShiftPx
+                   : (ultrawide ? (double)fHUDWidthOffset : (double)fHUDHeightOffset);
+    gMarkTrX = ultrawide ? -shiftPx : 0.0;
+    gMarkTrY = ultrawide ?  0.0 : -shiftPx;
+    gMarkerWidgets.clear();   // drop stale pointers from a previous HUD instance
+    TranslateMarkersRec(reinterpret_cast<SDK::UObject*>(hud), 0);
+  } catch (...) {}
+}
+
+// Border identify/fix tool: walk the HUD tree and act on every widget matching sBorderWidget.
+static SDK::UObject* gFnSetRenderOpacity = nullptr;
+static SDK::UObject* gFnBorderScaleFn = nullptr;
+static void BorderOpRec(SDK::UObject* w, int depth, int mode, bool ultrawide, double shiftPx)
+{
+    if (!PtrLooksValid(w) || depth > 9) return;
+    std::string nm = w->GetName();
+    if (nm.find(sBorderWidget) != std::string::npos) {
+        SDK::UClass* c = ObjClass(w);
+        if (mode == 0) {                                   // hide -> identify
+            if (!gFnSetRenderOpacity && PtrLooksValid(c)) gFnSetRenderOpacity = FindUFunction(c, "SetRenderOpacity");
+            if (gFnSetRenderOpacity) { float op = 0.0f; ProcessEvent_sh.thiscall<void>(w, gFnSetRenderOpacity, &op); }
+            spdlog::info("Border HIDE '{}'", nm);
+        } else if (mode == 1) {                            // shiftL -> render-translate to screen edge
+            if (!gSetRenderTranslationFn && PtrLooksValid(c)) gSetRenderTranslationFn = FindUFunction(c, "SetRenderTranslation");
+            if (gSetRenderTranslationFn) {
+                double tr[2] = { ultrawide ? -shiftPx : 0.0, ultrawide ? 0.0 : -shiftPx };
+                ProcessEvent_sh.thiscall<void>(w, gSetRenderTranslationFn, tr);
+            }
+            spdlog::info("Border SHIFT '{}' ({:.0f})", nm, shiftPx);
+        } else {                                           // scale -> counter-scale to full screen
+            if (!gFnBorderScaleFn && PtrLooksValid(c)) gFnBorderScaleFn = FindUFunction(c, "SetRenderScale");
+            if (gFnBorderScaleFn) {
+                double sc[2] = { ultrawide ? (double)iCurrentResX / (double)fHUDWidth : 1.0,
+                                 ultrawide ? 1.0 : (double)iCurrentResY / (double)fHUDHeight };
+                ProcessEvent_sh.thiscall<void>(w, gFnBorderScaleFn, sc);
+            }
+            spdlog::info("Border SCALE '{}'", nm);
+        }
+        return;   // whole subtree is affected; no need to descend
+    }
+    if (ObjectIsA(w, "UserWidget")) {
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        if (PtrLooksValid(root)) BorderOpRec(reinterpret_cast<SDK::UObject*>(root), depth + 1, mode, ultrawide, shiftPx);
+    }
+    if (ObjectIsA(w, "PanelWidget")) {
+        void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
+        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
+        if (PtrLooksValid(sd) && num > 0 && num <= 256)
+            for (int i = 0; i < num; ++i) {
+                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
+                if (!PtrLooksValid(s)) continue;
+                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);
+                if (PtrLooksValid(ch)) BorderOpRec(ch, depth + 1, mode, ultrawide, shiftPx);
+            }
+    }
+}
+static void ApplyBorderOp(void* hud)
+{
+  try {
+    if (sBorderWidget.empty() || iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
+    int mode = (sBorderMode == "shiftL") ? 1 : (sBorderMode == "scale") ? 2 : 0;
+    const bool ultrawide = (fAspectRatio > fNativeAspect);
+    double shiftPx = (iBorderShiftPx >= 0) ? (double)iBorderShiftPx
+                   : (ultrawide ? (double)fHUDWidthOffset : (double)fHUDHeightOffset);
+    spdlog::info("ApplyBorderOp: match='{}' mode={} shiftPx={:.0f}", sBorderWidget, sBorderMode, shiftPx);
+    BorderOpRec(reinterpret_cast<SDK::UObject*>(hud), 0, mode, ultrawide, shiftPx);
+  } catch (...) {}
+}
+
+// Shrink tool: render-scale (about ShrinkPivot) every widget whose name contains sShrinkWidget.
+static SDK::UObject* gFnShrinkScale = nullptr;
+static SDK::UObject* gFnShrinkPivot = nullptr;
+static void ShrinkRec(SDK::UObject* w, int depth)
+{
+    if (!PtrLooksValid(w) || depth > 9) return;
+    std::string nm = w->GetName();
+    if (nm.find(sShrinkWidget) != std::string::npos) {
+        SDK::UClass* c = ObjClass(w);
+        if (!gFnShrinkPivot && PtrLooksValid(c)) gFnShrinkPivot = FindUFunction(c, "SetRenderTransformPivot");
+        if (!gFnShrinkScale && PtrLooksValid(c)) gFnShrinkScale = FindUFunction(c, "SetRenderScale");
+        if (gFnShrinkPivot) { double pv[2] = { dShrinkPivotX, dShrinkPivotY }; ProcessEvent_sh.thiscall<void>(w, gFnShrinkPivot, pv); }
+        if (gFnShrinkScale) { double sc[2] = { dShrinkScale, dShrinkScale }; ProcessEvent_sh.thiscall<void>(w, gFnShrinkScale, sc); }
+        if (dShrinkOffsetX != 0.0 || dShrinkOffsetY != 0.0) {
+            if (!gSetRenderTranslationFn) { SDK::UClass* tc = ObjClass(w); if (PtrLooksValid(tc)) gSetRenderTranslationFn = FindUFunction(tc, "SetRenderTranslation"); }
+            if (gSetRenderTranslationFn) { double tr[2] = { dShrinkOffsetX, dShrinkOffsetY }; ProcessEvent_sh.thiscall<void>(w, gSetRenderTranslationFn, tr); }
+        }
+        spdlog::info("Shrink '{}' scale={:.3f} pivot=({:.2f},{:.2f}) offset=({:.0f},{:.0f})",
+            nm, dShrinkScale, dShrinkPivotX, dShrinkPivotY, dShrinkOffsetX, dShrinkOffsetY);
+        return;   // whole subtree scales with it
+    }
+    if (ObjectIsA(w, "UserWidget")) {
+        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+        if (PtrLooksValid(root)) ShrinkRec(reinterpret_cast<SDK::UObject*>(root), depth + 1);
+    }
+    if (ObjectIsA(w, "PanelWidget")) {
+        void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
+        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
+        if (PtrLooksValid(sd) && num > 0 && num <= 256)
+            for (int i = 0; i < num; ++i) {
+                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
+                if (!PtrLooksValid(s)) continue;
+                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);
+                if (PtrLooksValid(ch)) ShrinkRec(ch, depth + 1);
+            }
+    }
+}
+static void ApplyShrink(void* hud)
+{
+  try {
+    if (sShrinkWidget.empty()) return;
+    spdlog::info("ApplyShrink: match='{}' scale={:.3f}", sShrinkWidget, dShrinkScale);
+    ShrinkRec(reinterpret_cast<SDK::UObject*>(hud), 0);
+  } catch (...) {}
 }
 
 static void ConstrainIfHud(void* widget)   // std::string -> no __try here
 {
+  try {
     if (!PtrLooksValid(widget) || iCurrentResX <= 0) return;
     if (gDoneConstrain.count(widget)) return;
+    // Only UUserWidgets have SetAnchorsInViewport; AddWidget can be handed other widget types.
+    if (!ObjectIsA(reinterpret_cast<SDK::UObject*>(widget), "UserWidget")) return;
     std::string name = reinterpret_cast<SDK::UObject*>(widget)->GetName();
     if (!ShouldConstrain(name)) return;
+    if (name.find("WB_HUDLayout") != std::string::npos) gHudWidget = widget;
     DumpChildren(widget, name);
 
     if (!gSetAnchorsFn) {
         SDK::UClass* c = ObjClass(reinterpret_cast<SDK::UObject*>(widget));
         if (PtrLooksValid(c)) gSetAnchorsFn = FindUFunction(c, "SetAnchorsInViewport");
         if (!gSetAnchorsFn) { spdlog::warn("SetAnchorsInViewport fn not found"); return; }
+    }
+
+    if (bDiagnostic && !gFnSetRenderTransform) {
+        SDK::UClass* wc = ObjClass(reinterpret_cast<SDK::UObject*>(widget));
+        if (PtrLooksValid(wc)) {
+            gFnSetRenderTransform    = FindUFunction(wc, "SetRenderTransform");
+            gFnSetRenderTranslation  = FindUFunction(wc, "SetRenderTranslation");
+            gFnSetPositionInViewport = FindUFunction(wc, "SetPositionInViewport");
+            spdlog::info("PosLog fns: RT={} RTr={} PIV={}", (void*)gFnSetRenderTransform,
+                (void*)gFnSetRenderTranslation, (void*)gFnSetPositionInViewport);
+        }
     }
 
     const bool ultrawide = (fAspectRatio > fNativeAspect);
@@ -658,6 +1025,10 @@ static void ConstrainIfHud(void* widget)   // std::string -> no __try here
     spdlog::info("Constrained '{}' -> anchors ({:.3f},{:.3f})-({:.3f},{:.3f}) [doubles]", name, anc[0], anc[1], anc[2], anc[3]);
 
     CounterScaleVignettes(widget);   // restore full-screen overlays (e.g. the HUD damage vignette)
+    CounterTranslateMarkers(widget); // realign world-tracked interact prompt(s)
+    ApplyBorderOp(widget);           // identify/fix the screen-edge border decoration (INI-driven)
+    ApplyShrink(widget);             // shrink a named widget e.g. the fairy portrait (INI-driven)
+  } catch (...) {}
 }
 
 // UGameViewportSubsystem::AddWidget(rcx=subsystem, rdx=widget, r8=?, r9=slot template)
