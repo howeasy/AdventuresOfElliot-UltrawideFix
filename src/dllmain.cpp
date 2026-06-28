@@ -28,6 +28,8 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <clocale>
+#include <chrono>
 
 #define spdlog_confparse(var) spdlog::info("Config Parse: {}: {}", #var, var)
 
@@ -35,7 +37,7 @@ HMODULE exeModule = GetModuleHandle(NULL);
 HMODULE thisModule;
 
 std::string sFixName = "HUDFix";
-std::string sFixVersion = "1.0.1";
+std::string sFixVersion = "1.2.0";
 std::filesystem::path sFixPath;
 
 inipp::Ini<char> ini;
@@ -56,19 +58,61 @@ bool bDiagnostic = true;
 int  iSweepIntervalMs = 2000;
 int  iMarkerShiftPx = -1;   // interact-prompt anchor shift in px; -1 = auto (= HUD pillarbox offset)
 
-// Border-decoration identify/fix tool (off unless BorderWidget is set). Operates on every widget in
-// the HUD tree whose name contains BorderWidget: hide=make invisible (to identify it), shiftL=render-
-// translate to the screen edge, scale=counter-scale to full screen. BorderShiftPx -1 = auto(=offset).
-std::string sBorderWidget = "";
-std::string sBorderMode = "hide";   // hide | shiftL | scale
-int  iBorderShiftPx = -1;
+// ===================== Dynamic rule engine (data-driven HUD element fixes) =====================
+// Every per-element adjustment is a Rule parsed from a [Rule.*] section of HUDFix.ini, matched
+// against widget names as the HUD tree is walked. One op per rule:
+//   move       - render-scale once (preserves the widget's own animation) + reposition by Offset.
+//                Canvas-slot widgets move via SetPosition (stable layout channel, re-applied so a
+//                game re-layout can't knock them); overlay widgets move via a one-shot translation.
+//   hide       - SetRenderOpacity(0), re-applied so it stays hidden.
+//   fullscreen - expand a child back past the 16:9 band to full screen (damage vignette, frames).
+//   marker     - world-tracked prompt (interact icon, magic-unavailable, ...): translate its inner
+//                content root by the pillarbox shift, re-applied each frame.
+//   nocrop     - exclude this top-level widget from the 16:9 constraint entirely (keep it full-screen,
+//                e.g. world-tracked speech/emoticon bubbles that must track NPCs across the full width).
+enum { OP_MOVE = 0, OP_HIDE = 1, OP_FULLSCREEN = 2, OP_MARKER = 3, OP_NOCROP = 4 };
+struct Rule {
+    std::vector<std::string> match;     // ANY of these matches the widget name (substring or exact)
+    bool   exact = false;
+    int    op = OP_MOVE;
+    double scale = 1.0, pivotX = 0.5, pivotY = 0.5, offX = 0.0, offY = 0.0;
+    std::string label;
+};
+static std::vector<Rule> gRules;
 
-// Shrink tool: render-scale every HUD widget whose name contains ShrinkWidget. ShrinkScale<1 shrinks;
-// ShrinkPivotX/Y choose the anchor the scale pulls toward (0,1 = bottom-left corner stays put).
-std::string sShrinkWidget = "";
-double dShrinkScale = 1.0;
-double dShrinkPivotX = 0.5, dShrinkPivotY = 0.5;
-double dShrinkOffsetX = 0.0, dShrinkOffsetY = 0.0;   // px nudge after scaling (-X=left, +Y=down)
+static std::vector<std::string> SplitCsv(std::string s)
+{
+    std::vector<std::string> out; size_t p;
+    while ((p = s.find(',')) != std::string::npos) { out.push_back(s.substr(0, p)); s.erase(0, p + 1); }
+    out.push_back(s);
+    std::vector<std::string> r;
+    for (auto& t : out) {
+        size_t a = t.find_first_not_of(" \t"); if (a == std::string::npos) continue;
+        size_t b = t.find_last_not_of(" \t"); r.push_back(t.substr(a, b - a + 1));
+    }
+    return r;
+}
+static void ParseRules()   // called from Configuration() after the ini is parsed
+{
+    std::setlocale(LC_NUMERIC, "C");   // std::stod below must use '.' decimals regardless of game locale
+    gRules.clear();
+    for (auto& sec : ini.sections) {
+        if (sec.first.rfind("Rule.", 0) != 0) continue;   // sections named [Rule.<anything>]
+        auto& kv = sec.second;
+        auto S = [&](const char* k) -> std::string { auto it = kv.find(k); return it != kv.end() ? it->second : std::string(); };
+        Rule r; r.label = sec.first;
+        r.match = SplitCsv(S("Match"));
+        if (r.match.empty()) continue;
+        std::string ex = S("Exact"); for (auto& c : ex) if (c >= 'A' && c <= 'Z') c += 32;
+        r.exact = (ex == "true" || ex == "1");
+        std::string op = S("Op"); for (auto& c : op) if (c >= 'A' && c <= 'Z') c += 32;
+        r.op = (op == "hide") ? OP_HIDE : (op == "fullscreen") ? OP_FULLSCREEN : (op == "marker") ? OP_MARKER
+             : (op == "nocrop") ? OP_NOCROP : OP_MOVE;
+        auto D = [&](const char* k, double& out) { auto it = kv.find(k); if (it != kv.end()) { try { out = std::stod(it->second); } catch (...) {} } };
+        D("Scale", r.scale); D("PivotX", r.pivotX); D("PivotY", r.pivotY); D("OffsetX", r.offX); D("OffsetY", r.offY);
+        gRules.push_back(r);
+    }
+}
 
 // [Debug] isolation toggles (default everything OFF -> minimal probe that only logs + idles)
 bool bInstallResHook = false;
@@ -103,7 +147,10 @@ void Logging()
     try {
         logger = spdlog::basic_logger_st(sFixName.c_str(), sExePath.string() + sLogFile, true);
         spdlog::set_default_logger(logger);
-        spdlog::flush_on(spdlog::level::debug);
+        // Flush only on warnings/errors + every 2s (NOT per info line) — a synchronous per-line flush
+        // during a HUD reload (fast travel) blocks the game thread into a lockup.
+        spdlog::flush_on(spdlog::level::warn);
+        spdlog::flush_every(std::chrono::seconds(2));
         spdlog::info("----------");
         spdlog::info("{:s} v{:s} loaded.", sFixName.c_str(), sFixVersion.c_str());
         spdlog::info("Module: {0:s} @ 0x{1:x}", sExeName.c_str(), (uintptr_t)exeModule);
@@ -130,32 +177,21 @@ void Configuration()
         inipp::get_value(ini.sections["Fix HUD"], "Diagnostic", bDiagnostic);
         inipp::get_value(ini.sections["Fix HUD"], "SweepIntervalMs", iSweepIntervalMs);
         inipp::get_value(ini.sections["Fix HUD"], "MarkerShiftPx", iMarkerShiftPx);
-        inipp::get_value(ini.sections["Fix HUD"], "BorderWidget", sBorderWidget);
-        inipp::get_value(ini.sections["Fix HUD"], "BorderMode", sBorderMode);
-        inipp::get_value(ini.sections["Fix HUD"], "BorderShiftPx", iBorderShiftPx);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkWidget", sShrinkWidget);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkScale", dShrinkScale);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkPivotX", dShrinkPivotX);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkPivotY", dShrinkPivotY);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkOffsetX", dShrinkOffsetX);
-        inipp::get_value(ini.sections["Fix HUD"], "ShrinkOffsetY", dShrinkOffsetY);
         inipp::get_value(ini.sections["Debug"], "InstallResHook", bInstallResHook);
         inipp::get_value(ini.sections["Debug"], "EnableSweep", bEnableSweep);
         inipp::get_value(ini.sections["Debug"], "SweepStartDelayMs", iSweepStartDelayMs);
+        ParseRules();
     }
     spdlog_confparse(bFixHUD);
     spdlog_confparse(bDiagnostic);
     spdlog_confparse(iSweepIntervalMs);
     spdlog_confparse(iMarkerShiftPx);
-    spdlog_confparse(sBorderWidget);
-    spdlog_confparse(sBorderMode);
-    spdlog_confparse(iBorderShiftPx);
-    spdlog_confparse(sShrinkWidget);
-    spdlog_confparse(dShrinkScale);
-    spdlog_confparse(dShrinkPivotX);
-    spdlog_confparse(dShrinkPivotY);
-    spdlog_confparse(dShrinkOffsetX);
-    spdlog_confparse(dShrinkOffsetY);
+    spdlog::info("Parsed {} rule(s):", gRules.size());
+    for (auto& r : gRules) {
+        std::string m; for (auto& x : r.match) m += (m.empty() ? "" : ",") + x;
+        spdlog::info("  [{}] op={} match=[{}] exact={} scale={:.3f} pivot=({:.2f},{:.2f}) off=({:.0f},{:.0f})",
+            r.label, r.op, m, r.exact, r.scale, r.pivotX, r.pivotY, r.offX, r.offY);
+    }
     spdlog_confparse(bInstallResHook);
     spdlog_confparse(bEnableSweep);
     spdlog_confparse(iSweepStartDelayMs);
@@ -486,17 +522,6 @@ static void SetRenderScaleSEH(void* w, float* scaleXY)  // FVector2D Scale
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-static void CounterScaleVignettes(void* hud);   // forward decl (defined in the AddToScreen section)
-
-// Constrained widgets to keep re-applying the dim/border expansion to (beats menu open animations).
-struct ConstrainedW { void* w; uint64_t t; };
-static std::vector<ConstrainedW> gConstrainedList;
-static uint64_t gLastReapplyMs = 0;
-
-static void ReapplyOneSEH(void* w)   // POD wrapper so PE hook can __try around C++ work
-{
-    __try { CounterScaleVignettes(w); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
 
 // ---- Diagnostic: watch how the game positions widgets each frame (find the world-tracked Ⓧ) ----
 // Resolved (canonical UWidget/UUserWidget UFunctions) in ConstrainIfHud once.
@@ -548,7 +573,7 @@ static void DumpTreeTick()
     if (!PtrLooksValid(gHudWidget)) return;
     static uint64_t lastDump = 0; static int dumps = 0;
     uint64_t now = GetTickCount64();
-    if (dumps >= 6 || now - lastDump < 3000) return;
+    if (dumps >= 30 || now - lastDump < 2000) return;
     lastDump = now; ++dumps;
     spdlog::info("=== TREE dump #{} (HUD descendants) ===", dumps);
     int budget = 700;
@@ -556,36 +581,75 @@ static void DumpTreeTick()
   } catch (...) {}
 }
 
-// Cached interact-prompt widgets (set when constraining the HUD) + a lightweight live logger that
-// prints their slot pos / anchors / render-transform and the resulting predicted screen X. This is
-// how we measure the true coordinate transform (vs full-tree dumps, which hitch the game thread).
-static std::vector<void*> gMarkerWidgets;          // cached OUTER InteractiveGuideWidget(s)
-static SDK::UObject* gSetRenderTranslationFn = nullptr;
-static double gMarkTrX = 0.0, gMarkTrY = 0.0;      // correction applied to each prompt's inner root
-static void MarkerStateTick()
+// ---- rule engine state + per-frame re-assert (the apply/match functions live further down) ----
+struct RuleTarget { void* w; int rule; bool captured; bool overlay; float natL, natT; std::string name; };
+static std::vector<RuleTarget> gRuleTargets;                              // re-apply cache (HUD-root only)
+static std::unordered_map<void*, std::pair<float, float>> gRuleNatural;   // widget -> true natural slot pos
+static double gMarkTrX = 0.0, gMarkTrY = 0.0;                             // marker shift (set in ApplyRules)
+
+// Shared, lazily-resolved UFunctions (render-level on UWidget; slot-level on UCanvasPanelSlot).
+static SDK::UObject* gFnRenderScale = nullptr, * gFnRenderPivot = nullptr, * gFnRenderTrans = nullptr,
+                   * gFnRenderOpacity = nullptr, * gFnSlotSetPos = nullptr, * gFnSlotSetAnchors = nullptr;
+static SDK::UObject* ResolveFn(SDK::UObject*& cache, SDK::UObject* fromObj, const char* name)
 {
-  try {
-    if (gMarkerWidgets.empty() || fHUDWidth <= 0.0f || !gSetRenderTranslationFn) return;
-    static uint64_t last = 0; uint64_t now = GetTickCount64();
-    if (now - last < 1000) return; last = now;
-    for (void* p : gMarkerWidgets) {
-        if (!PtrLooksValid(p)) continue;
-        SDK::UObject* w = reinterpret_cast<SDK::UObject*>(p);
-        SDK::UObject* slot = RdMem<SDK::UObject*>(w, OFF_Widget_Slot);
-        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
-        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
-        SDK::UObject* tgt = PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root) : w;
-        // re-apply the correction to the inner root (idempotent) so it survives show/hide/recreate
-        double tr[2] = { gMarkTrX, gMarkTrY };
-        ProcessEvent_sh.thiscall<void>(tgt, gSetRenderTranslationFn, tr);
-        if (bDiagnostic && PtrLooksValid(slot) && ObjectIsA(slot, "CanvasPanelSlot")) {
-            float irx = RdMem<float>(tgt, 0x90), iry = RdMem<float>(tgt, 0x94);
-            float* o = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(slot) + OFF_CanvasSlot_LayoutData);
-            spdlog::info("MARK '{}' outerPos=({:.0f},{:.0f}) innerRT=({:.0f},{:.0f}) shift=({:.0f},{:.0f})",
-                w->GetName(), o[0], o[1], irx, iry, gMarkTrX, gMarkTrY);
-        }
+    if (!cache && PtrLooksValid(fromObj)) { SDK::UClass* c = ObjClass(fromObj); if (PtrLooksValid(c)) cache = FindUFunction(c, name); }
+    return cache;
+}
+static SDK::UObject* InnerRoot(SDK::UObject* w)   // a UserWidget's content root (else the widget itself)
+{
+    SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
+    SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
+    return PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root) : w;
+}
+
+// Re-assert one cached target each tick. Keeps moves/markers/hides locked against game-driven
+// re-layout WITHOUT re-touching render scale (that would freeze the widget's own idle animation).
+static void ReassertTarget(RuleTarget& t)
+{
+    if (!PtrLooksValid(t.w) || t.rule < 0 || t.rule >= (int)gRules.size()) return;
+    SDK::UObject* w = reinterpret_cast<SDK::UObject*>(t.w);
+    // Identity check: on fast travel the old HUD is freed for the seconds the new level loads, leaving
+    // this cached pointer dangling. Only touch it if it is still the SAME live widget (name matches) —
+    // a freed/reused address won't match, so we never call a UFunction on garbage (which can hang the
+    // game's layout). A faulting GetName on an unmapped address is caught by RulesTick's SEH.
+    if (w->GetName() != t.name) {
+        if (bDiagnostic) { static std::unordered_set<std::string> warned;
+            if (warned.insert(t.name).second) spdlog::info("REASSERT skip(name) cached='{}' live='{}'", t.name, w->GetName()); }
+        return;
     }
-  } catch (...) {}
+    const Rule& r = gRules[t.rule];
+    if (bDiagnostic) { static std::unordered_set<std::string> okd;
+        if (okd.insert(t.name).second) spdlog::info("REASSERT ok '{}' op={} captured={}", t.name, r.op, (int)t.captured); }
+    if (r.op == OP_MARKER) {
+        SDK::UObject* inner = InnerRoot(w);
+        if (gFnRenderTrans) { double tr[2] = { (double)t.natL, (double)t.natT }; ProcessEvent_sh.thiscall<void>(inner, gFnRenderTrans, tr); }
+    } else if (r.op == OP_HIDE) {
+        if (gFnRenderOpacity) { float op = 0.0f; ProcessEvent_sh.thiscall<void>(w, gFnRenderOpacity, &op); }
+    } else if (r.op == OP_MOVE && t.captured) {   // canvas-slot move: re-pin position via SetPosition
+        SDK::UObject* slot = RdMem<SDK::UObject*>(w, OFF_Widget_Slot);
+        if (PtrLooksValid(slot) && gFnSlotSetPos && ObjectIsA(slot, "CanvasPanelSlot")) {
+            double pos[2] = { (double)t.natL + r.offX, (double)t.natT + r.offY };
+            ProcessEvent_sh.thiscall<void>(slot, gFnSlotSetPos, pos);
+        }
+    } else if (r.op == OP_MOVE && t.overlay) {    // overlay move: re-pin via inner-root render-translation
+        SDK::UObject* inner = InnerRoot(w);        // natL/natT hold the offset for overlay targets
+        if (gFnRenderTrans) { double tr[2] = { (double)t.natL, (double)t.natT }; ProcessEvent_sh.thiscall<void>(inner, gFnRenderTrans, tr); }
+    }
+}
+// Per-frame re-assert. Cached widget pointers can go stale between an old HUD being freed and the new
+// one being constrained, so each re-assert is wrapped in SEH (C++ catch(...) does NOT catch access
+// violations under /EHsc). Index loop (not range-for) keeps this function SEH-compatible (no unwinding
+// locals). Re-entrancy is prevented by tlInApply in the hooks, so gRuleTargets is never mutated here.
+static void RulesTick()
+{
+    if (gRules.empty() || gRuleTargets.empty()) return;
+    static uint64_t last = 0; uint64_t now = GetTickCount64();
+    if (now - last < 150) return; last = now;
+    size_t n = gRuleTargets.size();
+    for (size_t i = 0; i < n; ++i) {
+        __try { ReassertTarget(gRuleTargets[i]); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }
 static std::unordered_map<std::string, int> gPosLogCount;   // throttle per (object,fn)
 static const char* PosFnTag(SDK::UObject* fn)
@@ -615,10 +679,20 @@ static void PosLog(SDK::UObject* obj, SDK::UObject* fn, void* params)
 // game thread; with Diagnostic on we also sample the game's own positioning calls to find markers.
 void __fastcall ProcessEvent_hk(SDK::UObject* obj, SDK::UObject* fn, void* params)
 {
-    if (bDiagnostic && params &&
-        (fn == gFnSetRenderTransform || fn == gFnSetRenderTranslation || fn == gFnSetPositionInViewport))
-        PosLog(obj, fn, params);
-    MarkerStateTick();   // functional: re-applies the interact-prompt correction (logs only if Diagnostic)
+    // tlInApply guards against re-entrancy: our UFunction calls (trampoline) can make the game dispatch
+    // nested ProcessEvents through this hook. Skip all engine work on re-entry so gRuleTargets is never
+    // mutated mid-iteration and we don't recurse RulesTick/ApplyRules.
+    if (!tlInApply) {
+        tlInApply = true;
+        __try {
+            if (bDiagnostic && params &&
+                (fn == gFnSetRenderTransform || fn == gFnSetRenderTranslation || fn == gFnSetPositionInViewport))
+                PosLog(obj, fn, params);
+            RulesTick();         // functional: re-asserts all dynamic rule targets (markers/moves/hides)
+            if (bDiagnostic) DumpTreeTick();   // diagnostic: capture HUD tree to identify new widgets
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        tlInApply = false;   // always reset, even if a diagnostic call SEH-faulted
+    }
     ProcessEvent_sh.thiscall<void>(obj, fn, params);
 }
 
@@ -661,9 +735,18 @@ static std::unordered_set<void*> gDoneConstrain;
 
 // Constrain every top-level UI widget EXCEPT full-screen overlays (fades/movies/loading), which
 // must keep covering the whole screen.
+// A 'nocrop' rule excludes a top-level widget from the 16:9 constraint (keeps it full-screen).
+static bool MatchesNoCrop(const std::string& n)
+{
+    for (auto& r : gRules)
+        if (r.op == OP_NOCROP)
+            for (auto& m : r.match)
+                if (r.exact ? (n == m) : (n.find(m) != std::string::npos)) return true;
+    return false;
+}
 static bool ShouldConstrain(const std::string& n)
 {
-    return !NameExcluded(n);
+    return !NameExcluded(n) && !MatchesNoCrop(n);
 }
 
 // One-time per widget class: dump direct child widget names so we can find full-screen dim /
@@ -711,274 +794,165 @@ static void DumpChildren(void* widget, const std::string& widgetName)
   } catch (...) {}
 }
 
-// World-tracked marker widgets (e.g. the interact-prompt mark shown next to NPCs/items). These
-// position themselves via ProjectWorldToScreen in FULL-screen pixels, so when their parent HUD is
-// constrained to 16:9 (origin shifted in by the pillarbox) they render offset by +HUDWidthOffset.
-// We counter-translate them back by -HUDWidthOffset to realign with the world.
-static bool IsWorldMarkerName(const std::string& n)
-{
-    // The Ⓧ interact prompt. It lives deep in WB_HUDLayout > Overlay_0 > CanvasPanel_0, positioned
-    // by absolute canvas-slot pos = ProjectWorldToScreen (full-screen px) every frame. Inside the
-    // 16:9-constrained HUD (origin at +HUDWidthOffset) it renders that far too far right.
-    return n.find("InteractiveGuideWidget") != std::string::npos;
-}
+// ---- rule application (initial, walked during constrain) ----
 
-// Full-screen child overlays that must NOT be pillarboxed (damage/screen vignettes). When the HUD
-// root is constrained to 16:9 they get squeezed too, so we counter-scale them back to full width.
-static SDK::UObject* gSetRenderScaleFn2 = nullptr;
-static bool IsVignetteName(const std::string& n)
+// fullscreen op: expand a child back past the constrained 16:9 band to full screen. Canvas-slot
+// children overflow their anchors (layout, survives animations); overlay children render-scale.
+static void ApplyFullscreen(SDK::UObject* child)
 {
-    // Full-screen overlay widgets inside the non-clipping gameplay HUD that must cover the whole
-    // screen (e.g. the damage vignette). Menu BackgroundBlur dims sample their layout geometry,
-    // which the 16:9 viewport slot bounds, so they can't be extended this way and are left as-is.
-    return n.find("dying") != std::string::npos || n.find("Dying") != std::string::npos ||
-           n.find("Vignette") != std::string::npos || n.find("vignette") != std::string::npos ||
-           n.find("Damage") != std::string::npos || n.find("ScreenEffect") != std::string::npos;
-}
-
-// Disable clip-to-bounds on a widget so overflowing full-screen children can render past 16:9.
-static SDK::UObject* gSetClippingFn = nullptr;
-static constexpr int OFF_Widget_Clipping = 0xDB;   // EWidgetClipping (uint8); Inherit=0
-static void DisableClip(SDK::UObject* w)
-{
-    if (!PtrLooksValid(w)) return;
-    uint8_t cur = RdMem<uint8_t>(w, OFF_Widget_Clipping);
-    if (cur == 0) return;   // already Inherit (no clip)
-    if (!gSetClippingFn) {
-        SDK::UClass* c = ObjClass(w);
-        if (PtrLooksValid(c)) gSetClippingFn = FindUFunction(c, "SetClipping");
-        if (!gSetClippingFn) return;
+    const bool uw = (fAspectRatio > fNativeAspect);
+    const double span = uw ? ((double)iCurrentResX / (double)fHUDWidth) : ((double)iCurrentResY / (double)fHUDHeight);
+    const double off = (span - 1.0) / 2.0;
+    SDK::UObject* slot = RdMem<SDK::UObject*>(child, OFF_Widget_Slot);
+    if (PtrLooksValid(slot) && ObjectIsA(slot, "CanvasPanelSlot")) {
+        double ovr[4] = { 0.0, 0.0, 1.0, 1.0 };
+        if (uw) { ovr[0] = -off; ovr[2] = 1.0 + off; } else { ovr[1] = -off; ovr[3] = 1.0 + off; }
+        if (ResolveFn(gFnSlotSetAnchors, slot, "SetAnchors")) ProcessEvent_sh.thiscall<void>(slot, gFnSlotSetAnchors, ovr);
+    } else {
+        double sc[2] = { uw ? span : 1.0, uw ? 1.0 : span };
+        if (ResolveFn(gFnRenderScale, child, "SetRenderScale")) ProcessEvent_sh.thiscall<void>(child, gFnRenderScale, sc);
     }
-    uint8_t inherit[4] = { 0, 0, 0, 0 };   // EWidgetClipping::Inherit
-    ProcessEvent_sh.thiscall<void>(w, gSetClippingFn, inherit);
-    spdlog::info("  disabled clip (was {}) on '{}'", (int)cur, w->GetName());
 }
 
-static SDK::UObject* gSlotSetAnchorsFn = nullptr;
-static void CounterScaleVignettes(void* hud)
+// Match a widget name to a rule. Exact matches always win over substring matches (independent of
+// section/file order, since inipp iterates sections alphabetically); first substring otherwise.
+static int MatchRuleIdx(const std::string& name)
 {
-  try {
-    if (iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
-    SDK::UObject* tree = RdMem<SDK::UObject*>(hud, OFF_UserWidget_WidgetTree);
-    if (!PtrLooksValid(tree)) return;
-    SDK::UWidget* root = RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget);
-    if (!PtrLooksValid(root)) return;
-    void* slotsData = RdMem<void*>(root, OFF_PanelWidget_Slots);
-    int num = RdMem<int32_t>(root, OFF_PanelWidget_Slots + 0x08);
-    if (!PtrLooksValid(slotsData) || num <= 0 || num > 256) return;
-
-    const bool ultrawide = (fAspectRatio > fNativeAspect);
-    const double span = ultrawide ? ((double)iCurrentResX / (double)fHUDWidth)
-                                   : ((double)iCurrentResY / (double)fHUDHeight);   // 1.333
-    const double off = (span - 1.0) / 2.0;                                          // 0.1667
-    double scale[2] = { ultrawide ? span : 1.0, ultrawide ? 1.0 : span };
-    // Overflow anchors expand the child past the constrained 16:9 parent back to full screen.
-    double ovr[4] = { 0.0, 0.0, 1.0, 1.0 };
-    if (ultrawide) { ovr[0] = -off; ovr[2] = 1.0 + off; }
-    else           { ovr[1] = -off; ovr[3] = 1.0 + off; }
-
-    for (int i = 0; i < num; ++i) {
-        SDK::UObject* slot0 = reinterpret_cast<SDK::UObject**>(slotsData)[i];
-        if (!PtrLooksValid(slot0)) continue;
-        SDK::UObject* child = RdMem<SDK::UObject*>(slot0, 0x30);   // UPanelSlot::Content
-        if (!PtrLooksValid(child)) continue;
-        std::string cn = child->GetName();
-        if (!IsVignetteName(cn)) continue;
-
-        // Preferred: overflow the child's own canvas slot anchors (layout, survives animations).
-        SDK::UObject* childSlot = RdMem<SDK::UObject*>(child, OFF_Widget_Slot);
-        bool didAnchor = false;
-        if (PtrLooksValid(childSlot) && ObjectIsA(childSlot, "CanvasPanelSlot")) {
-            if (!gSlotSetAnchorsFn) {
-                SDK::UClass* sc = ObjClass(childSlot);
-                if (PtrLooksValid(sc)) gSlotSetAnchorsFn = FindUFunction(sc, "SetAnchors");
-            }
-            if (gSlotSetAnchorsFn) {
-                ProcessEvent_sh.thiscall<void>(childSlot, gSlotSetAnchorsFn, ovr);
-                didAnchor = true;
-                spdlog::info("Vignette '{}' anchors->overflow ({:.3f}..{:.3f})", cn, ovr[0], ovr[2]);
-            }
+    int sub = -1;
+    for (size_t i = 0; i < gRules.size(); ++i)
+        for (auto& m : gRules[i].match) {
+            if (gRules[i].exact) { if (name == m) return (int)i; }
+            else if (sub < 0 && name.find(m) != std::string::npos) sub = (int)i;
         }
-        // Fallback (overlay children with no canvas slot): render scale.
-        if (!didAnchor) {
-            if (!gSetRenderScaleFn2) {
-                SDK::UClass* c = ObjClass(child);
-                if (PtrLooksValid(c)) gSetRenderScaleFn2 = FindUFunction(c, "SetRenderScale");
-            }
-            if (gSetRenderScaleFn2) {
-                ProcessEvent_sh.thiscall<void>(child, gSetRenderScaleFn2, scale);
-                spdlog::info("Vignette '{}' render-scale ({:.3f},{:.3f})", cn, scale[0], scale[1]);
+    return sub;
+}
+
+// Apply a matched rule's op to a widget. When collect=true (HUD root), also cache it for per-frame
+// re-assert. Scale is applied ONCE (re-applying it would freeze the widget's idle animation); the
+// position/marker/hide parts are what get re-asserted in ReassertTarget.
+static void ApplyRuleToWidget(SDK::UObject* w, int ruleIdx, bool collect)
+{
+    const Rule& r = gRules[ruleIdx];
+    if (r.op == OP_NOCROP) return;   // handled at constraint time (ShouldConstrain); nothing to apply here
+    if (bDiagnostic) {               // log each unique rule->widget once (never per-constrain) to avoid a storm
+        static std::unordered_set<std::string> logged;
+        std::string k = r.label + ">" + w->GetName();
+        if (logged.insert(k).second) spdlog::info("Rule [{}] -> '{}' op={}", r.label, w->GetName(), r.op);
+    }
+    RuleTarget t{ w, ruleIdx, false, false, 0.0f, 0.0f, w->GetName() };   // name = identity check for re-assert
+    if (r.op == OP_HIDE) {
+        if (ResolveFn(gFnRenderOpacity, w, "SetRenderOpacity")) { float op = 0.0f; ProcessEvent_sh.thiscall<void>(w, gFnRenderOpacity, &op); }
+    } else if (r.op == OP_FULLSCREEN) {
+        ApplyFullscreen(w);
+    } else if (r.op == OP_MARKER) {
+        // Per-axis shift override: a non-zero rule Offset on an axis replaces the global MarkerShiftPx
+        // on that axis (so you can nudge Y alone). Stored in t for the per-frame re-assert.
+        double mx = (r.offX != 0.0) ? r.offX : gMarkTrX;
+        double my = (r.offY != 0.0) ? r.offY : gMarkTrY;
+        t.natL = (float)mx; t.natT = (float)my;
+        SDK::UObject* inner = InnerRoot(w);
+        if (ResolveFn(gFnRenderTrans, inner, "SetRenderTranslation")) { double tr[2] = { mx, my }; ProcessEvent_sh.thiscall<void>(inner, gFnRenderTrans, tr); }
+    } else { // OP_MOVE: render-scale once + reposition (applied for EVERY match, not just the HUD root)
+        if (r.scale != 1.0) {
+            if (ResolveFn(gFnRenderPivot, w, "SetRenderTransformPivot")) { double pv[2] = { r.pivotX, r.pivotY }; ProcessEvent_sh.thiscall<void>(w, gFnRenderPivot, pv); }
+            if (ResolveFn(gFnRenderScale, w, "SetRenderScale")) { double sc[2] = { r.scale, r.scale }; ProcessEvent_sh.thiscall<void>(w, gFnRenderScale, sc); }
+        }
+        if (r.offX != 0.0 || r.offY != 0.0) {
+            SDK::UObject* slot = RdMem<SDK::UObject*>(w, OFF_Widget_Slot);
+            if (PtrLooksValid(slot) && ObjectIsA(slot, "CanvasPanelSlot")) {
+                // Canvas slot: move via SetPosition (stable, invalidates layout). Capture the TRUE natural
+                // position once per widget (persist across re-constrains within a HUD gen) so it can't compound.
+                float* off = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(slot) + OFF_CanvasSlot_LayoutData);
+                auto it = gRuleNatural.find(w);
+                if (it == gRuleNatural.end()) { gRuleNatural[w] = { off[0], off[1] }; it = gRuleNatural.find(w); }
+                t.natL = it->second.first; t.natT = it->second.second; t.captured = true;
+                bool posOk = ResolveFn(gFnSlotSetPos, slot, "SetPosition") != nullptr;
+                if (posOk) {
+                    double pos[2] = { (double)t.natL + r.offX, (double)t.natT + r.offY };
+                    ProcessEvent_sh.thiscall<void>(slot, gFnSlotSetPos, pos);
+                }
+                if (bDiagnostic) { static std::unordered_set<std::string> mlog;
+                    if (mlog.insert(w->GetName()).second) spdlog::info("MOVE '{}' canvas nat=({:.0f},{:.0f}) off=({:.0f},{:.0f}) -> ({:.0f},{:.0f}) scaleFn={} posFn={}",
+                        w->GetName(), t.natL, t.natT, r.offX, r.offY, t.natL + r.offX, t.natT + r.offY, (void*)gFnRenderScale, (void*)gFnSlotSetPos); }
+            } else {
+                // Overlay slot has no movable layout position. Translate the widget's INNER content root and
+                // re-assert it each frame (same channel as the interact marker): an overlay panel is often
+                // shown LATER than the HUD-load walk and its OUTER transform is reset on show, so a one-shot
+                // outer translate is lost. The inner WBP content is left alone by the game, so it sticks.
+                SDK::UObject* inner = InnerRoot(w);
+                t.overlay = true; t.natL = (float)r.offX; t.natT = (float)r.offY;
+                if (ResolveFn(gFnRenderTrans, inner, "SetRenderTranslation")) { double tr[2] = { r.offX, r.offY }; ProcessEvent_sh.thiscall<void>(inner, gFnRenderTrans, tr); }
+                if (bDiagnostic) { static std::unordered_set<std::string> olog;
+                    if (olog.insert(w->GetName()).second) spdlog::info("MOVE '{}' OVERLAY inner-root translate off=({:.0f},{:.0f}) re-asserted", w->GetName(), r.offX, r.offY); }
             }
         }
     }
-  } catch (...) {}
+    // Cache for per-frame re-assert (HUD root only). Fullscreen persists one-shot so it needn't re-assert.
+    if (collect && r.op != OP_FULLSCREEN) {
+        for (auto& e : gRuleTargets) if (e.w == w) return;   // dedupe
+        gRuleTargets.push_back(t);
+    }
 }
 
-// Recursively find the world-tracked interact prompt(s) and shift their canvas-slot ANCHOR so the
-// absolute slot position the game writes each frame (it never touches anchors) realigns inside the
-// constrained HUD. Anchor a is in parent-fraction; moving it by -shift/HUDWidth offsets the prompt's
-// origin back toward the true screen edge. Also caches the widget for the live MARK logger.
-static void TranslateMarkersRec(SDK::UObject* w, int depth)
+// Walk a widget subtree applying rules. budget caps the TOTAL nodes visited: during a level transition
+// (fast travel) the widget tree is mid-construction, so RdMem can read garbage that looks like a panel
+// with hundreds of children pointing to more garbage panels — without a total-node cap the recursion
+// explodes (256^depth) and the game freezes. The real HUD is well under the cap.
+static void ApplyRulesRec(SDK::UObject* w, int depth, bool collect, int& budget, bool insideMoved)
 {
-    if (!PtrLooksValid(w) || depth > 7) return;
-    if (IsWorldMarkerName(w->GetName())) {
-        // Translate the prompt's INNER content root. The game writes the OUTER widget's slot pos AND
-        // its render transform every frame (clobbering anything set there), but never touches the
-        // inner WBP content, so a render-translation on the inner root is a stable band-offset fix.
-        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
-        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
-        SDK::UObject* tgt = PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root) : w;
-        if (!gSetRenderTranslationFn) {
-            SDK::UClass* c = ObjClass(tgt);
-            if (PtrLooksValid(c)) gSetRenderTranslationFn = FindUFunction(c, "SetRenderTranslation");
+    if (!PtrLooksValid(w) || depth > 24 || budget <= 0) return;
+    --budget;
+    int idx = MatchRuleIdx(w->GetName());
+    if (idx >= 0) {
+        const int op = gRules[idx].op;
+        if (op != OP_MOVE) {
+            // hide/fullscreen/marker/nocrop claim their whole subtree.
+            ApplyRuleToWidget(w, idx, collect);
+            return;
         }
-        if (gSetRenderTranslationFn) {
-            double tr[2] = { gMarkTrX, gMarkTrY };
-            ProcessEvent_sh.thiscall<void>(tgt, gSetRenderTranslationFn, tr);
-            bool seen = false; for (void* p : gMarkerWidgets) if (p == w) { seen = true; break; }
-            if (!seen) gMarkerWidgets.push_back(w);
-            spdlog::info("Interact marker '{}' inner-root translate ({:.0f},{:.0f}) root='{}'",
-                w->GetName(), gMarkTrX, gMarkTrY,
-                PtrLooksValid(root) ? reinterpret_cast<SDK::UObject*>(root)->GetName() : "self");
-        }
-        return;
+        // OP_MOVE: apply ONLY the outermost move, then keep descending. A descendant that also matches a
+        // move rule must NOT be transformed again — it already inherits this widget's render scale, so a
+        // second scale/reposition double-shrinks and shifts it (the fairy "not moved properly" regression).
+        // We still descend so deeper NON-move rules (e.g. hiding an internal Decoration_L) keep working.
+        if (!insideMoved) { ApplyRuleToWidget(w, idx, collect); insideMoved = true; }
     }
     if (ObjectIsA(w, "UserWidget")) {
-        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
-        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
-        if (PtrLooksValid(root)) TranslateMarkersRec(reinterpret_cast<SDK::UObject*>(root), depth + 1);
+        SDK::UObject* root = InnerRoot(w);
+        if (root != w) ApplyRulesRec(root, depth + 1, collect, budget, insideMoved);
     }
     if (ObjectIsA(w, "PanelWidget")) {
         void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
         int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
         if (PtrLooksValid(sd) && num > 0 && num <= 256)
-            for (int i = 0; i < num; ++i) {
+            for (int i = 0; i < num && budget > 0; ++i) {
                 SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
                 if (!PtrLooksValid(s)) continue;
                 SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);   // UPanelSlot::Content
-                if (PtrLooksValid(ch)) TranslateMarkersRec(ch, depth + 1);
+                if (PtrLooksValid(ch)) ApplyRulesRec(ch, depth + 1, collect, budget, insideMoved);
             }
     }
-}
-static void CounterTranslateMarkers(void* hud)
-{
-  try {
-    if (iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
-    const bool ultrawide = (fAspectRatio > fNativeAspect);
-    double shiftPx = (iMarkerShiftPx >= 0) ? (double)iMarkerShiftPx
-                   : (ultrawide ? (double)fHUDWidthOffset : (double)fHUDHeightOffset);
-    gMarkTrX = ultrawide ? -shiftPx : 0.0;
-    gMarkTrY = ultrawide ?  0.0 : -shiftPx;
-    gMarkerWidgets.clear();   // drop stale pointers from a previous HUD instance
-    TranslateMarkersRec(reinterpret_cast<SDK::UObject*>(hud), 0);
-  } catch (...) {}
 }
 
-// Border identify/fix tool: walk the HUD tree and act on every widget matching sBorderWidget.
-static SDK::UObject* gFnSetRenderOpacity = nullptr;
-static SDK::UObject* gFnBorderScaleFn = nullptr;
-static void BorderOpRec(SDK::UObject* w, int depth, int mode, bool ultrawide, double shiftPx)
-{
-    if (!PtrLooksValid(w) || depth > 9) return;
-    std::string nm = w->GetName();
-    if (nm.find(sBorderWidget) != std::string::npos) {
-        SDK::UClass* c = ObjClass(w);
-        if (mode == 0) {                                   // hide -> identify
-            if (!gFnSetRenderOpacity && PtrLooksValid(c)) gFnSetRenderOpacity = FindUFunction(c, "SetRenderOpacity");
-            if (gFnSetRenderOpacity) { float op = 0.0f; ProcessEvent_sh.thiscall<void>(w, gFnSetRenderOpacity, &op); }
-            spdlog::info("Border HIDE '{}'", nm);
-        } else if (mode == 1) {                            // shiftL -> render-translate to screen edge
-            if (!gSetRenderTranslationFn && PtrLooksValid(c)) gSetRenderTranslationFn = FindUFunction(c, "SetRenderTranslation");
-            if (gSetRenderTranslationFn) {
-                double tr[2] = { ultrawide ? -shiftPx : 0.0, ultrawide ? 0.0 : -shiftPx };
-                ProcessEvent_sh.thiscall<void>(w, gSetRenderTranslationFn, tr);
-            }
-            spdlog::info("Border SHIFT '{}' ({:.0f})", nm, shiftPx);
-        } else {                                           // scale -> counter-scale to full screen
-            if (!gFnBorderScaleFn && PtrLooksValid(c)) gFnBorderScaleFn = FindUFunction(c, "SetRenderScale");
-            if (gFnBorderScaleFn) {
-                double sc[2] = { ultrawide ? (double)iCurrentResX / (double)fHUDWidth : 1.0,
-                                 ultrawide ? 1.0 : (double)iCurrentResY / (double)fHUDHeight };
-                ProcessEvent_sh.thiscall<void>(w, gFnBorderScaleFn, sc);
-            }
-            spdlog::info("Border SCALE '{}'", nm);
-        }
-        return;   // whole subtree is affected; no need to descend
-    }
-    if (ObjectIsA(w, "UserWidget")) {
-        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
-        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
-        if (PtrLooksValid(root)) BorderOpRec(reinterpret_cast<SDK::UObject*>(root), depth + 1, mode, ultrawide, shiftPx);
-    }
-    if (ObjectIsA(w, "PanelWidget")) {
-        void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
-        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
-        if (PtrLooksValid(sd) && num > 0 && num <= 256)
-            for (int i = 0; i < num; ++i) {
-                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
-                if (!PtrLooksValid(s)) continue;
-                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);
-                if (PtrLooksValid(ch)) BorderOpRec(ch, depth + 1, mode, ultrawide, shiftPx);
-            }
-    }
-}
-static void ApplyBorderOp(void* hud)
+// Entry point, called from ConstrainIfHud for every constrained top-level widget. The re-apply cache
+// is refreshed only from the gameplay HUD root (which owns the markers/moves); other widgets' ops
+// (menu vignettes etc.) are applied one-shot and persist on their own.
+static void ApplyRules(void* hud, bool isHudRoot)
 {
   try {
-    if (sBorderWidget.empty() || iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
-    int mode = (sBorderMode == "shiftL") ? 1 : (sBorderMode == "scale") ? 2 : 0;
-    const bool ultrawide = (fAspectRatio > fNativeAspect);
-    double shiftPx = (iBorderShiftPx >= 0) ? (double)iBorderShiftPx
-                   : (ultrawide ? (double)fHUDWidthOffset : (double)fHUDHeightOffset);
-    spdlog::info("ApplyBorderOp: match='{}' mode={} shiftPx={:.0f}", sBorderWidget, sBorderMode, shiftPx);
-    BorderOpRec(reinterpret_cast<SDK::UObject*>(hud), 0, mode, ultrawide, shiftPx);
-  } catch (...) {}
-}
-
-// Shrink tool: render-scale (about ShrinkPivot) every widget whose name contains sShrinkWidget.
-static SDK::UObject* gFnShrinkScale = nullptr;
-static SDK::UObject* gFnShrinkPivot = nullptr;
-static void ShrinkRec(SDK::UObject* w, int depth)
-{
-    if (!PtrLooksValid(w) || depth > 9) return;
-    std::string nm = w->GetName();
-    if (nm.find(sShrinkWidget) != std::string::npos) {
-        SDK::UClass* c = ObjClass(w);
-        if (!gFnShrinkPivot && PtrLooksValid(c)) gFnShrinkPivot = FindUFunction(c, "SetRenderTransformPivot");
-        if (!gFnShrinkScale && PtrLooksValid(c)) gFnShrinkScale = FindUFunction(c, "SetRenderScale");
-        if (gFnShrinkPivot) { double pv[2] = { dShrinkPivotX, dShrinkPivotY }; ProcessEvent_sh.thiscall<void>(w, gFnShrinkPivot, pv); }
-        if (gFnShrinkScale) { double sc[2] = { dShrinkScale, dShrinkScale }; ProcessEvent_sh.thiscall<void>(w, gFnShrinkScale, sc); }
-        if (dShrinkOffsetX != 0.0 || dShrinkOffsetY != 0.0) {
-            if (!gSetRenderTranslationFn) { SDK::UClass* tc = ObjClass(w); if (PtrLooksValid(tc)) gSetRenderTranslationFn = FindUFunction(tc, "SetRenderTranslation"); }
-            if (gSetRenderTranslationFn) { double tr[2] = { dShrinkOffsetX, dShrinkOffsetY }; ProcessEvent_sh.thiscall<void>(w, gSetRenderTranslationFn, tr); }
-        }
-        spdlog::info("Shrink '{}' scale={:.3f} pivot=({:.2f},{:.2f}) offset=({:.0f},{:.0f})",
-            nm, dShrinkScale, dShrinkPivotX, dShrinkPivotY, dShrinkOffsetX, dShrinkOffsetY);
-        return;   // whole subtree scales with it
-    }
-    if (ObjectIsA(w, "UserWidget")) {
-        SDK::UObject* tree = RdMem<SDK::UObject*>(w, OFF_UserWidget_WidgetTree);
-        SDK::UWidget* root = PtrLooksValid(tree) ? RdMem<SDK::UWidget*>(tree, OFF_WidgetTree_RootWidget) : nullptr;
-        if (PtrLooksValid(root)) ShrinkRec(reinterpret_cast<SDK::UObject*>(root), depth + 1);
-    }
-    if (ObjectIsA(w, "PanelWidget")) {
-        void* sd = RdMem<void*>(w, OFF_PanelWidget_Slots);
-        int num = RdMem<int32_t>(w, OFF_PanelWidget_Slots + 0x08);
-        if (PtrLooksValid(sd) && num > 0 && num <= 256)
-            for (int i = 0; i < num; ++i) {
-                SDK::UObject* s = reinterpret_cast<SDK::UObject**>(sd)[i];
-                if (!PtrLooksValid(s)) continue;
-                SDK::UObject* ch = RdMem<SDK::UObject*>(s, 0x30);
-                if (PtrLooksValid(ch)) ShrinkRec(ch, depth + 1);
-            }
-    }
-}
-static void ApplyShrink(void* hud)
-{
-  try {
-    if (sShrinkWidget.empty()) return;
-    spdlog::info("ApplyShrink: match='{}' scale={:.3f}", sShrinkWidget, dShrinkScale);
-    ShrinkRec(reinterpret_cast<SDK::UObject*>(hud), 0);
+    if (gRules.empty() || iCurrentResX <= 0 || fHUDWidth <= 0.0f) return;
+    const bool uw = (fAspectRatio > fNativeAspect);
+    double shiftPx = (iMarkerShiftPx >= 0) ? (double)iMarkerShiftPx : (uw ? (double)fHUDWidthOffset : (double)fHUDHeightOffset);
+    gMarkTrX = uw ? -shiftPx : 0.0;
+    gMarkTrY = uw ? 0.0 : -shiftPx;
+    if (isHudRoot) gRuleTargets.clear();   // refresh re-apply cache from the live HUD tree
+    // Total-node cap. The real HUD is a few thousand nodes; a mid-construction garbage tree explodes to
+    // 256^depth instantly, so any cap well above the real size stops the freeze without truncating the
+    // legit walk. 8000 was too tight once 'move' ops started descending their full subtrees.
+    int budget = 200000;
+    int start = budget;
+    ApplyRulesRec(reinterpret_cast<SDK::UObject*>(hud), 0, isHudRoot, budget, false);
+    if (bDiagnostic) spdlog::info("ApplyRules('{}', hudRoot={}) walked {} nodes (budget left={})",
+        reinterpret_cast<SDK::UObject*>(hud)->GetName(), isHudRoot, start - budget, budget);
   } catch (...) {}
 }
 
@@ -986,12 +960,22 @@ static void ConstrainIfHud(void* widget)   // std::string -> no __try here
 {
   try {
     if (!PtrLooksValid(widget) || iCurrentResX <= 0) return;
-    if (gDoneConstrain.count(widget)) return;
     // Only UUserWidgets have SetAnchorsInViewport; AddWidget can be handed other widget types.
     if (!ObjectIsA(reinterpret_cast<SDK::UObject*>(widget), "UserWidget")) return;
     std::string name = reinterpret_cast<SDK::UObject*>(widget)->GetName();
     if (!ShouldConstrain(name)) return;
-    if (name.find("WB_HUDLayout") != std::string::npos) gHudWidget = widget;
+    bool isHudRoot = (name.find("WB_HUDLayout") != std::string::npos);
+    if (isHudRoot && widget != gHudWidget) {
+        // New HUD generation: the previous HUD's widgets are freed. Flush every cache that keys on raw
+        // widget pointers so a reused address can't (a) poison natural-position lookups, (b) falsely mark
+        // a new widget already-constrained, or (c) be re-asserted as a stale target.
+        gHudWidget = widget;
+        gDoneConstrain.clear();
+        gSeenAdd.clear();
+        gRuleNatural.clear();
+        gRuleTargets.clear();
+    }
+    if (gDoneConstrain.count(widget)) return;   // checked AFTER the gen flush so reuse can't suppress it
     DumpChildren(widget, name);
 
     if (!gSetAnchorsFn) {
@@ -1024,10 +1008,9 @@ static void ConstrainIfHud(void* widget)   // std::string -> no __try here
     gDoneConstrain.insert(widget);
     spdlog::info("Constrained '{}' -> anchors ({:.3f},{:.3f})-({:.3f},{:.3f}) [doubles]", name, anc[0], anc[1], anc[2], anc[3]);
 
-    CounterScaleVignettes(widget);   // restore full-screen overlays (e.g. the HUD damage vignette)
-    CounterTranslateMarkers(widget); // realign world-tracked interact prompt(s)
-    ApplyBorderOp(widget);           // identify/fix the screen-edge border decoration (INI-driven)
-    ApplyShrink(widget);             // shrink a named widget e.g. the fairy portrait (INI-driven)
+    // Apply all INI rules (markers/moves/hides/fullscreen) to this widget's subtree. The re-apply
+    // cache is refreshed only from the gameplay HUD root (it owns the world-tracked + moved widgets).
+    ApplyRules(widget, isHudRoot);
   } catch (...) {}
 }
 
@@ -1036,7 +1019,12 @@ void __fastcall AddToScreen_hk(void* subsystem, void* widget, void* r8, void* tm
 {
     __try { LogAddToScreen(widget, tmpl); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     AddToScreen_sh.thiscall<void>(subsystem, widget, r8, tmpl);
-    if (bFixHUD) { __try { ConstrainIfHud(widget); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    // Same re-entrancy guard as ProcessEvent_hk: never mutate gRuleTargets while RulesTick iterates it.
+    if (bFixHUD && !tlInApply) {
+        tlInApply = true;
+        __try { ConstrainIfHud(widget); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        tlInApply = false;
+    }
 }
 
 void HookAddToScreen()
